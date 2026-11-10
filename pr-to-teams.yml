@@ -1,0 +1,84 @@
+name: PR updates to Teams
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, review_requested, closed, synchronize]
+  pull_request_review:
+    types: [submitted]
+  push:
+    branches: [main, develop]   # the branches your PRs merge into
+
+permissions:
+  contents: read
+  pull-requests: write   # to add/remove the "has-conflict" label
+  issues: write          # labels live on the issues API
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+
+jobs:
+  # Opened / review requested / approved / changes requested / merged / closed
+  pr-status:
+    if: github.event_name != 'push' && github.event.action != 'synchronize' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+
+      - name: Post status to Teams
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          SENDER: ${{ github.event.sender.login }}
+          CREATED_AT: ${{ github.event.pull_request.created_at }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          status=""; color="Default"; actor="$SENDER"
+
+          case "$EVENT:$ACTION" in
+            pull_request_target:opened|pull_request_target:reopened|pull_request_target:ready_for_review)
+              status="🆕 New PR raised"; color="Accent" ;;
+
+            pull_request_target:review_requested)
+              # If the reviewer was picked while creating the PR, the "New PR" card
+              # already shows them, so skip to avoid a duplicate message.
+              age=$(( $(date +%s) - $(date -d "$CREATED_AT" +%s) ))
+              if [ "$age" -gt 120 ]; then status="👀 Review requested"; color="Accent"; fi ;;
+
+            pull_request_target:closed)
+              # Only announce merges; PRs closed without merging are ignored
+              if [ "$MERGED" = "true" ]; then status="✅ Merged"; color="Good"; fi ;;
+
+            pull_request_review:submitted)
+              case "$REVIEW_STATE" in
+                approved)          status="👍 Approved";          color="Good" ;;
+                changes_requested) status="✏️ Changes requested"; color="Warning" ;;
+              esac ;;
+          esac
+
+          if [ -n "$status" ]; then
+            bash .github/scripts/teams-notify.sh "$PR" "$status" "$color" "$actor"
+          else
+            echo "Nothing to post for $EVENT/$ACTION"
+          fi
+
+  # Conflict detection: runs when the target branch moves, or a PR gets new commits
+  conflict-check:
+    if: github.event_name == 'push' || (github.event.action == 'synchronize' && !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+
+      - name: Check open PRs for merge conflicts
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash .github/scripts/check-conflicts.sh
